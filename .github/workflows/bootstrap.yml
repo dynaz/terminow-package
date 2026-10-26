@@ -32,6 +32,10 @@ on:
         description: "Comma separated packages to build for the package repository only, defaults to the ones in scripts/terminow/config.sh"
         required: false
         default: ""
+      architectures:
+        description: "Comma separated architectures to build (aarch64,x86_64,arm,i686), defaults to the ones in scripts/terminow/config.sh"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -45,10 +49,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
-      # Empty values fall back to the defaults of scripts/terminow/config.sh
+      # Empty values fall back to the defaults of scripts/terminow/config.sh (config.sh uses
+      # ${VAR:=default}, so an empty value is treated the same as unset).
       TERMINOW_PACKAGES_REF: ${{ inputs.packages_ref }}
       TERMINOW_EXTRA_PACKAGES: ${{ inputs.extra_packages }}
       TERMINOW_REPO_PACKAGES: ${{ inputs.repo_packages }}
+      TERMINOW_ARCHITECTURES: ${{ inputs.architectures }}
     steps:
       - name: Clone repository
         uses: actions/checkout@v6
