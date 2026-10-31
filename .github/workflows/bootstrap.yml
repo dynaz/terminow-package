@@ -89,7 +89,18 @@ jobs:
           git -C "$RUNNER_TEMP/work/termux-packages" remote add origin "$TERMINOW_PACKAGES_REPO"
           git -C "$RUNNER_TEMP/work/termux-packages" fetch -q --depth 1 origin "$TERMINOW_PACKAGES_REF"
           git -C "$RUNNER_TEMP/work/termux-packages" checkout -q FETCH_HEAD
-          "$RUNNER_TEMP/work/termux-packages/scripts/free-space.sh"
+          # free-space.sh frees ~36G for the build, but it also runs
+          # `rm -rf /opt/runner-cache /opt/actionarchivecache`. On current GitHub runner
+          # images (Node 20 was removed on 2026-09-23, so actions now run on the bundled
+          # Node 24) the live runner's Node under
+          # /home/runner/actions-runner/cached/<version>/externals/node24 is backed by
+          # those caches, so removing them leaves the actions/checkout post-job credential
+          # cleanup unable to start Node ("No such file or directory"). Keep those two
+          # runner-owned caches (a few hundred MB) while still freeing everything else, so
+          # the security cleanup still runs. See the build failure in run 41193611526.
+          free_space="$RUNNER_TEMP/work/termux-packages/scripts/free-space.sh"
+          sed -i -E 's@[[:space:]]+/opt/actionarchivecache@@g; s@[[:space:]]+/opt/runner-cache@@g' "$free_space"
+          "$free_space"
           # python3 is used by the checks of the bootstrap and the repository, free-space.sh may remove it
           sudo apt-get install -yq --no-install-recommends jq apt-utils gnupg xz-utils python3
 
