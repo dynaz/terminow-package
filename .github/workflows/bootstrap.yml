@@ -15,6 +15,9 @@ on:
   push:
     branches:
       - main
+      # Isolated x86_64 staging validation only; never publishes to gh-pages (see the
+      # staging-build-repo and staging-emulate jobs, which drop to contents: read).
+      - x86_64-staging-validation
     paths:
       - 'scripts/terminow/**'
       - '.github/workflows/bootstrap.yml'
@@ -46,6 +49,9 @@ concurrency:
 
 jobs:
   bootstrap:
+    # The production build that force-pushes gh-pages and cuts a release. It must never run for the
+    # staging branch, whose push only exercises the isolated staging jobs below.
+    if: ${{ github.ref != 'refs/heads/x86_64-staging-validation' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
@@ -203,3 +209,177 @@ jobs:
             cat "$props"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # =================================================================================================
+  # Isolated x86_64 staging validation. Runs ONLY on the x86_64-staging-validation branch. It builds
+  # a signed x86_64 apt repository and validates it on an x86_64 emulator, and it CANNOT touch
+  # production: both jobs set permissions: contents: read (so they cannot push to gh-pages or create
+  # a release), the repository is served only over the runner loopback to the test emulator, and the
+  # production bootstrap job above is gated off for this branch. Production app sources and the
+  # ARM64 production packages on gh-pages are left entirely unchanged.
+  # =================================================================================================
+  staging-build-repo:
+    if: ${{ github.ref == 'refs/heads/x86_64-staging-validation' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      TERMINOW_ARCHITECTURES: x86_64
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v6
+
+      - name: Import repository signing key
+        env:
+          TERMINOW_REPO_GPG_PRIVATE_KEY: ${{ secrets.TERMINOW_REPO_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TERMINOW_REPO_GPG_PRIVATE_KEY" ]; then
+            echo "::error::The TERMINOW_REPO_GPG_PRIVATE_KEY secret is not set, see scripts/terminow/generate-repo-key.sh"
+            exit 1
+          fi
+          printf '%s\n' "$TERMINOW_REPO_GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+
+      - name: Build the x86_64 bootstrap and repository packages
+        run: |
+          . scripts/terminow/config.sh
+          git init -q "$RUNNER_TEMP/work/termux-packages"
+          git -C "$RUNNER_TEMP/work/termux-packages" remote add origin "$TERMINOW_PACKAGES_REPO"
+          git -C "$RUNNER_TEMP/work/termux-packages" fetch -q --depth 1 origin "$TERMINOW_PACKAGES_REF"
+          git -C "$RUNNER_TEMP/work/termux-packages" checkout -q FETCH_HEAD
+          # Keep the runner-owned Node caches so the post-job cleanup still runs, as the production
+          # job does (see the comment there and run 41193611526).
+          free_space="$RUNNER_TEMP/work/termux-packages/scripts/free-space.sh"
+          sed -i -E 's@[[:space:]]+/opt/actionarchivecache@@g; s@[[:space:]]+/opt/runner-cache@@g' "$free_space"
+          "$free_space"
+          sudo apt-get install -yq --no-install-recommends jq apt-utils gnupg xz-utils python3
+          ./scripts/terminow/build-bootstrap.sh "$RUNNER_TEMP/work"
+
+      - name: Create and verify the signed x86_64 staging repository
+        run: |
+          . scripts/terminow/config.sh
+          ./scripts/terminow/make-apt-repo.sh "$RUNNER_TEMP/work/termux-packages/output" "$RUNNER_TEMP/site/apt/terminow-main"
+          release="$RUNNER_TEMP/site/apt/terminow-main/dists/stable/Release"
+          inrelease="$RUNNER_TEMP/site/apt/terminow-main/dists/stable/InRelease"
+          index="$RUNNER_TEMP/site/apt/terminow-main/dists/stable/main/binary-x86_64/Packages"
+          echo "=== indexes present ==="
+          ls -l "$index" "$index.gz" "$index.xz" "$release" "$inrelease" "$RUNNER_TEMP/site/apt/terminow-main/dists/stable/Release.gpg"
+          echo "=== architecture line (must be x86_64, no aarch64) ==="
+          grep -E '^(Architectures|Components|No-Support-for-Architecture-all):' "$release"
+          echo "=== InRelease signature verifies against the repository key ==="
+          gpg --verify "$inrelease"
+          echo "=== required x86_64 packages are in the index with the right architecture ==="
+          for p in proot proot-distro nodejs npm openssh; do
+            awk -v p="$p" '$1=="Package:" && $2==p {pkg=1} pkg && $1=="Architecture:" {print p" -> "$2; pkg=0}' "$index"
+          done
+          for p in proot proot-distro nodejs npm; do
+            grep -qE "^Package: $p$" "$index" || { echo "::error::$p is missing from the x86_64 index"; exit 1; }
+          done
+          echo "=== dependency availability: apt simulated install, with signature verification ==="
+          ./scripts/terminow/test-repo-install.sh "$RUNNER_TEMP/site/apt/terminow-main" x86_64 proot proot-distro nodejs npm ${TERMINOW_EXTRA_PACKAGES//,/ }
+
+      - name: Upload the staging repository for the emulator job
+        uses: actions/upload-artifact@v6
+        with:
+          name: x86_64-staging-apt-repo
+          path: ${{ runner.temp }}/site/apt
+          if-no-files-found: error
+          retention-days: 3
+
+  staging-emulate:
+    if: ${{ github.ref == 'refs/heads/x86_64-staging-validation' }}
+    needs: staging-build-repo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      STAGING_PORT: "8099"
+    steps:
+      - name: Verify runner KVM and enable access
+        run: |
+          if [ ! -e /dev/kvm ]; then echo "::error::/dev/kvm is absent"; exit 1; fi
+          ls -la /dev/kvm
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download the staging repository
+        uses: actions/download-artifact@v6
+        with:
+          name: x86_64-staging-apt-repo
+          path: ${{ runner.temp }}/staging/apt
+
+      - name: Serve the staging repository on the runner loopback
+        run: |
+          set -euo pipefail
+          # The artifact was uploaded from <temp>/site/apt, so its contents are terminow-main/...
+          # Locate the InRelease and serve its grandparent-of-dists so the apt base ends in /apt.
+          inrelease="$(find "$RUNNER_TEMP/staging" -path '*/terminow-main/dists/stable/InRelease' | head -1)"
+          if [ -z "$inrelease" ]; then
+            echo "::error::staging InRelease not found in the downloaded artifact"; find "$RUNNER_TEMP/staging" | head -50; exit 1
+          fi
+          # .../<serve_root>/terminow-main/dists/stable/InRelease  ->  serve_root is 4 levels up
+          serve_root="$(cd "$(dirname "$inrelease")/../../../.." && pwd)"
+          echo "Serving $serve_root (so /terminow-main/... is reachable)"
+          cd "$serve_root"
+          nohup python3 -m http.server "$STAGING_PORT" --bind 0.0.0.0 > "$RUNNER_TEMP/staging-httpd.log" 2>&1 &
+          base_path="${inrelease#$serve_root/}"; base_path="${base_path%/terminow-main/dists/stable/InRelease}"
+          for i in $(seq 1 10); do
+            curl -fsS "http://127.0.0.1:$STAGING_PORT/$base_path/terminow-main/dists/stable/InRelease" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          echo "--- staging InRelease head ---"
+          curl -fsS "http://127.0.0.1:$STAGING_PORT/$base_path/terminow-main/dists/stable/InRelease" | head -8
+          # base_path is normally "apt"; the runtime script swaps the production ".../apt" base for this.
+          echo "TERMINOW_STAGING_BASE=http://10.0.2.2:$STAGING_PORT/$base_path" >> "$GITHUB_ENV"
+
+      - name: Checkout the app
+        uses: actions/checkout@v6
+        with:
+          repository: dynaz/termux-app
+          ref: x86_64-bootstrap-enable
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build the x86_64 debug APK
+        run: |
+          ./gradlew :app:assembleFullDebug
+          APK="$(find app/build/outputs/apk -name '*_x86_64.apk' | head -1)"
+          if [ -z "$APK" ]; then
+            echo "::error::No x86_64 APK built. Built: $(find app/build/outputs/apk -name '*.apk')"
+            exit 1
+          fi
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          echo "Built $APK"
+
+      - name: Run the hardened runtime checks against the staging repository
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 24
+          arch: x86_64
+          target: default
+          force-avd-creation: true
+          disable-animations: true
+          emulator-options: -no-window -no-snapshot -noaudio -no-boot-anim -gpu swiftshader_indirect -camera-back none -camera-front none
+          script: |
+            bash .github/scripts/x86_64_smoke.sh "$APK_PATH"
+            # TERMINOW_STAGING_BASE points only this emulator's apt at the loopback staging repo.
+            bash .github/scripts/x86_64_runtime.sh
+
+      - name: Upload the staging runtime logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: x86_64-staging-runtime-logs
+          path: |
+            logcat.txt
+            runtime.txt
+            smoke-result.txt
+            bash.bin
+            ${{ runner.temp }}/staging-httpd.log
+          if-no-files-found: ignore
